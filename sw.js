@@ -10,13 +10,13 @@ const APP_SHELL = [
   './',
   './index.html',
   './manifest.webmanifest',
-  './icons/favicon-16.png',
-  './icons/favicon-32.png',
-  './icons/apple-touch-icon.png',
-  './icons/icon-192.png',
-  './icons/icon-512.png',
-  './icons/icon-192-maskable.png',
-  './icons/icon-512-maskable.png',
+  './favicon-16.png',
+  './favicon-32.png',
+  './apple-touch-icon.png',
+  './icon-192.png',
+  './icon-512.png',
+  './icon-192-maskable.png',
+  './icon-512-maskable.png',
   'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js'
 ];
 
