@@ -10,7 +10,7 @@ const CACHE_NAME = 'nebula-touch-v1';
 
 const APP_SHELL = [
   './',
-  './index.html',
+  './Index.html',
   './manifest.json',
   './icons/icon-192.png',
   './icons/icon-512.png',
