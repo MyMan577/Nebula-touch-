@@ -35,6 +35,8 @@
   #stage {
     position: fixed; inset: 0;
     display: block;
+    touch-action: none;
+    contain: strict;
   }
 
   /* Title flash on load */
@@ -604,6 +606,15 @@
     border-radius: 13px;
   }
   #showDockBtn.visible { transform: translateX(0) scale(1); }
+  /* A live WebGL canvas behind frosted UI forces expensive compositing on mobile GPUs.
+     Prefer opaque panels whenever the device has a coarse touch pointer. */
+  @media (pointer: coarse) {
+    #dock, #showDockBtn, .chip {
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
+    }
+    #dock { background: rgba(10, 10, 18, 0.94); }
+  }
   @media (max-width: 420px) {
     #dock {
       top: max(8px, env(safe-area-inset-top));
@@ -700,7 +711,9 @@
       <div class="sidebar-actions">
         <button id="fpsCapBtn">60fps cap: off</button>
         <button id="clearBtn">Scatter</button>
+        <button id="autoPerfBtn" title="Optional only: may lower internal resolution, cap particle simulation, stagger expensive touch calculations, and refresh bloom less often when sustained slow frames are detected.">Auto safeguards: off</button>
       </div>
+      <p class="section-note">Auto safeguards are optional. When off, your exact particle target, sharpness, bloom cadence, and per-frame touch physics are fully preserved.</p>
       <div class="slider-group">
         <div class="slider-row"><span class="label">Particles</span><span class="value" id="densityVal">250</span></div>
         <input type="range" id="densitySlider" min="100" max="50000" value="250">
@@ -804,6 +817,20 @@ import * as THREE from 'three';
   }
   renderer.autoClear = false; // every target is either fully repainted by the fade quad or explicitly .clear()'d — see resize()/palette switch
   let W, H, DPR;
+  const hardwareThreads = navigator.hardwareConcurrency || 4;
+  const deviceMemoryGb = navigator.deviceMemory || 4;
+  const coarsePointer = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+  // Fidelity is the default: resolution, particle count, bloom cadence, and
+  // touch physics exactly match the user's controls. Optional safeguards can
+  // be enabled manually from Motion when a device needs extra headroom.
+  let renderQualityScale = 1;
+  let qualityMode = 'off';
+  let pendingQualityScale = null;
+  let slowFrameStreak = 0;
+  let fastFrameStreak = 0;
+  let cameraDirty = true;
+  let bloomFrameInterval = renderQualityScale <= 0.65 ? 2 : 1;
+  let bloomFrameCounter = 0;
 
   // ---------- Scene / camera ----------
   // Particles live in a real 3D volume: worldX/worldY mirror the old pixel
@@ -830,6 +857,7 @@ import * as THREE from 'three';
     if (particleMaterial) particleMaterial.uniforms.uSizeScale.value = dist;
     camera.position.set(0, 0, dist);
     camera.lookAt(0, 0, 0);
+    cameraDirty = false;
   }
 
   // Touches are still expressed in the same 2D "simulation space" every
@@ -898,6 +926,7 @@ import * as THREE from 'three';
     bubblegum: { name: 'Bubblegum', bg: '#08040d', colors: ['#ff8fd6', '#8fd6ff', '#d6ff8f', '#ffe08f', '#c98fff'] }
   };
   let paletteKey = 'neon';
+  let paletteBgFloat = hexToRgbFloat(PALETTES[paletteKey].bg);
 
   // ---------- Custom palettes ----------
   // User-created palettes get merged straight into PALETTES under a
@@ -944,7 +973,9 @@ import * as THREE from 'three';
 
   let sharpRender = true; // off = internal render resolution is halved (upscaled to fill screen) — big GPU-fillrate win on slow/high-DPI devices
   function resize() {
-    DPR = Math.min(window.devicePixelRatio || 1, 2) * (sharpRender ? 1 : 0.5);
+    // Scale the internal pixel budget independently from CSS dimensions. This is
+    // the strongest mobile-GPU safeguard because all trail and bloom passes use it.
+    DPR = Math.min(window.devicePixelRatio || 1, 2) * (sharpRender ? 1 : 0.5) * renderQualityScale;
     W = window.innerWidth;
     H = window.innerHeight;
     DEPTH = Math.min(W, H) * 0.5;
@@ -976,6 +1007,7 @@ import * as THREE from 'three';
     // active mode actually uses (flatRadius for everything except Sphere)
     if (particleMaterial) particleMaterial.uniforms.uSizeScale.value = camera.userData.orbitRadius;
 
+    cameraDirty = true;
     destroyFBOs();
     const bw = Math.max(1, Math.round(W * DPR)), bh = Math.max(1, Math.round(H * DPR));
     fbos = [makeFBO(bw, bh), makeFBO(bw, bh)];
@@ -983,10 +1015,11 @@ import * as THREE from 'three';
     clearTargetToColor(fbos[0], PALETTES[paletteKey].bg);
     clearTargetToColor(fbos[1], PALETTES[paletteKey].bg);
 
-    // Bloom runs at a quarter of the real resolution — plenty soft for a
-    // glow, and a quarter of the pixels is a quarter of the cost.
+    // Bloom is already softer than the source image; on reduced-quality
+    // devices it can safely use a smaller texture without a visible hard edge.
     destroyBloomFBOs();
-    const blw = Math.max(1, Math.round(bw / 4)), blh = Math.max(1, Math.round(bh / 4));
+    const bloomDivisor = renderQualityScale <= 0.65 ? 6 : (renderQualityScale <= 0.85 ? 5 : 4);
+    const blw = Math.max(1, Math.round(bw / bloomDivisor)), blh = Math.max(1, Math.round(bh / bloomDivisor));
     bloomFBOs = [makeFBO(blw, blh), makeFBO(blw, blh)];
   }
   window.addEventListener('resize', resize);
@@ -1393,20 +1426,23 @@ import * as THREE from 'three';
   function reconcilePopulation() {
     // step scales with how far we are from the target so huge jumps (e.g.
     // toward the 50000 cap) settle in a couple seconds, not a minute.
+    effectiveTargetCount = qualityMode === 'auto' ? Math.min(targetCount, particleBudget()) : targetCount;
     const previousCount = particles.length;
-    const step = Math.max(6, Math.ceil(Math.abs(targetCount - particles.length) / 30));
-    if (particles.length < targetCount) {
-      for (let i = 0; i < step && particles.length < targetCount; i++) {
+    const step = Math.max(6, Math.ceil(Math.abs(effectiveTargetCount - particles.length) / 30));
+    if (particles.length < effectiveTargetCount) {
+      for (let i = 0; i < step && particles.length < effectiveTargetCount; i++) {
         particles.push(makeParticle());
       }
-    } else if (particles.length > targetCount) {
-      particles.splice(0, Math.min(step, particles.length - targetCount));
+    } else if (particles.length > effectiveTargetCount) {
+      particles.splice(0, Math.min(step, particles.length - effectiveTargetCount));
     }
     if (particles.length !== previousCount) particleColorDirty = true;
   }
 
   // ---------- Pointer tracking (multi-touch) ----------
   const pointers = new Map(); // id -> {x,y,px,py,angle,vx,vy}
+  const pendingPointerSamples = new Map();
+  const MAX_ACTIVE_POINTERS = 5; // interaction modes intentionally top out at five fingers
 
   function updatePointer(id, x, y) {
     let p = pointers.get(id);
@@ -1420,7 +1456,28 @@ import * as THREE from 'three';
       p.vy = p.y - p.py;
     }
   }
-  function removePointer(id) { pointers.delete(id); }
+  function removePointer(id) {
+    pointers.delete(id);
+    pendingPointerSamples.delete(id);
+  }
+
+  function queuePointerSample(e) {
+    // Use only the latest coalesced sample. Intermediate hardware samples are
+    // redundant once the current animation frame has been missed.
+    const samples = typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : null;
+    const sample = samples && samples.length ? samples[samples.length - 1] : e;
+    pendingPointerSamples.set(e.pointerId, { x: sample.clientX, y: sample.clientY });
+  }
+
+  function flushPointerSamples() {
+    if (!pendingPointerSamples.size) return;
+    for (const [id, sample] of pendingPointerSamples) {
+      if (!pointers.has(id)) continue;
+      const s = screenToSim(sample.x, sample.y);
+      if (s) updatePointer(id, s.x, s.y);
+    }
+    pendingPointerSamples.clear();
+  }
 
   const RELEASE_STRENGTH = 6.5;
   const RELEASE_STRENGTH_BY_MODE = { Attract: 10, Orbit: 10.5, 'Gravity Well': 11, Whirlpool: 9, Bloom: 9, Lattice: 7, Prism: 8.5, Gyroscope: 8.5 };
@@ -1589,24 +1646,28 @@ import * as THREE from 'three';
   }
 
   canvas.addEventListener('pointerdown', (e) => {
+    if (!pointers.has(e.pointerId) && pointers.size >= MAX_ACTIVE_POINTERS) return;
     canvas.setPointerCapture(e.pointerId);
     document.getElementById('hint').classList.add('hidden');
     const s = screenToSim(e.clientX, e.clientY);
-    if (s) updatePointer(e.pointerId, s.x, s.y);
-  });
+    if (s) updatePointer(e.pointerId, s.x, s.y); // immediate first response
+  }, { passive: true });
   canvas.addEventListener('pointermove', (e) => {
     if (!pointers.has(e.pointerId)) return;
-    const s = screenToSim(e.clientX, e.clientY);
-    if (s) updatePointer(e.pointerId, s.x, s.y);
-  });
+    queuePointerSample(e);
+  }, { passive: true });
   canvas.addEventListener('pointerup', (e) => {
+    if (!pointers.has(e.pointerId)) return;
+    queuePointerSample(e);
+    flushPointerSamples(); // release physics uses the final delivered position
     releaseBurst(e.pointerId);
     removePointer(e.pointerId);
-  });
+  }, { passive: true });
   canvas.addEventListener('pointercancel', (e) => {
+    if (!pointers.has(e.pointerId)) return;
     releaseBurst(e.pointerId);
     removePointer(e.pointerId);
-  });
+  }, { passive: true });
 
   // A gentle random kick applied to the existing field — never changes count.
   function scatterField() {
@@ -1959,14 +2020,11 @@ import * as THREE from 'three';
     return { x: Math.cos(a) * r, y: band * 0.52 + Math.sin(theta * 5) * 0.22, z: Math.sin(a) * r };
   }
 
-  function applyHybrid3DForces(pt, dt, activePointers) {
-    const count = Math.min(5, activePointers.length);
-    // Hybrid modes use a single, smoothly moving interaction center. This
-    // prevents multiple fingers from issuing competing per-particle forces,
-    // while their count still changes the 3D form and force intensity.
-    let cx = 0, cy = 0;
-    for (let i = 0; i < activePointers.length; i++) { cx += activePointers[i].x; cy += activePointers[i].y; }
-    cx /= activePointers.length; cy /= activePointers.length;
+  function applyHybrid3DForces(pt, dt, touchSummary) {
+    const count = touchSummary.count;
+    // The touch centroid is prepared once per frame. Recomputing this five-item
+    // reduction for every particle was disproportionately costly in 3D modes.
+    const cx = touchSummary.cx, cy = touchSummary.cy;
     const dx = pt.x - cx, dy = pt.y - cy;
     const dist = Math.max(8, Math.hypot(dx, dy));
     const nx = dx / dist, ny = dy / dist;
@@ -2045,7 +2103,7 @@ import * as THREE from 'three';
   // here avoids allocating a brand new closure for every one of the
   // thousands of particles on every single frame, which is what was
   // actually causing the stutter at high particle counts.
-  function applyTouchForces(pt, dt, activePointers, polygon) {
+  function applyTouchForces(pt, dt, activePointers, polygon, touchSummary) {
     // Every mode in MODES_3D picks ONE shared shape, centered on screen,
     // that every particle springs toward together — Sphere additionally
     // varies its shape by how many fingers are down (cube/pyramid/helix/
@@ -2094,7 +2152,7 @@ import * as THREE from 'three';
         // formActive is true for the frame
         pt.formTargetZ = rz * SPHERE_RADIUS;
         pt.formActive = true;
-        if (HYBRID_3D_MODES.has(mode)) applyHybrid3DForces(pt, dt, activePointers);
+        if (HYBRID_3D_MODES.has(mode)) applyHybrid3DForces(pt, dt, touchSummary);
       }
       return;
     }
@@ -2113,10 +2171,14 @@ import * as THREE from 'three';
     for (let pi = 0; pi < activePointers.length; pi++) {
       const p = activePointers[pi];
       const dx = pt.x - p.x, dy = pt.y - p.y;
-      const dist = Math.max(6, Math.hypot(dx, dy));
+      // Avoid Math.hypot in this O(particles × active touches) path. A single
+      // square root on an already-clamped squared distance is cheaper and yields
+      // the same normalized vector used by every force below.
+      const dist = Math.sqrt(Math.max(36, dx * dx + dy * dy));
+      const invDist = 1 / dist;
       const reach = REACH_BY_MODE[mode] || FALLOFF_REACH;
       const falloff = reach / (reach + dist); // never reaches zero
-      const nx = dx / dist, ny = dy / dist;
+      const nx = dx * invDist, ny = dy * invDist;
 
       switch (mode) {
         case 'Swirl': {
@@ -2510,6 +2572,13 @@ import * as THREE from 'three';
         break;
       }
     }
+  }
+
+  function summarizeTouches(points) {
+    let cx = 0, cy = 0;
+    for (let i = 0; i < points.length; i++) { cx += points[i].x; cy += points[i].y; }
+    const count = points.length;
+    return { cx: cx / count, cy: cy / count, count };
   }
 
   // ---------- 3+ finger combos ----------
@@ -2951,6 +3020,40 @@ import * as THREE from 'three';
 
   const MAX_SPEED = 32;
   const MAX_SPEED_SQUARED = MAX_SPEED * MAX_SPEED;
+  let effectiveTargetCount = targetCount;
+  let touchSimulationPhase = 0;
+
+  function particleBudget() {
+    // CPU physics scales with particles × fingers. Keep automatic quality from
+    // accepting a slider target that would make multi-touch unusable on phones.
+    const base = coarsePointer ? (hardwareThreads <= 4 ? 4500 : 7500) : 16000;
+    return Math.max(800, Math.round(base * renderQualityScale * renderQualityScale));
+  }
+
+  function updateQualityGovernor(frameMs) {
+    if (qualityMode !== 'auto') return;
+    if (frameMs > 24) { slowFrameStreak++; fastFrameStreak = 0; }
+    else if (frameMs < 15) { fastFrameStreak++; slowFrameStreak = 0; }
+    else { slowFrameStreak = Math.max(0, slowFrameStreak - 1); fastFrameStreak = 0; }
+
+    if (slowFrameStreak >= 18 && renderQualityScale > 0.5) {
+      pendingQualityScale = Math.max(0.5, +(renderQualityScale - 0.1).toFixed(2));
+      slowFrameStreak = 0;
+    } else if (fastFrameStreak >= 180 && renderQualityScale < 1) {
+      pendingQualityScale = Math.min(1, +(renderQualityScale + 0.1).toFixed(2));
+      fastFrameStreak = 0;
+    }
+  }
+
+  function touchForceStrideFor(pointerCount, particleCount) {
+    // Safeguard-only behavior. With safeguards off, every selected particle
+    // receives every active touch force on every frame.
+    if (qualityMode !== 'auto' || pointerCount < 2) return 1;
+    const complexity = particleCount * pointerCount;
+    if (complexity > 42000) return 4;
+    if (complexity > 18000) return 2;
+    return 1;
+  }
   const MOTION_SCALE = 0.5; // scales how far velocity actually moves particles per frame — halves visible speed while leaving momentum/overshoot physics (which run on velocity, not position) untouched
   const EMPTY_POINTERS = []; // reused when no touches are active, so we don't allocate a new empty array every frame
   // Presets alter only audio-derived forces, size, glow, and trails. Touch
@@ -2965,7 +3068,15 @@ import * as THREE from 'three';
 
   function frame(now) {
     if (pausedForVisibility) return; // don't reschedule — visibilitychange restarts the loop when visible again
-    if (fpsCap && now - lastRender < 16.67) {
+    if (pendingQualityScale !== null) {
+      renderQualityScale = pendingQualityScale;
+      pendingQualityScale = null;
+      bloomFrameInterval = renderQualityScale <= 0.65 ? 2 : 1;
+      resize(); // intentionally rate-limited by the quality governor
+    }
+    // When the user selects a 60fps cap, keep active gestures responsive by
+    // allowing a presentation frame through instead of adding touch latency.
+    if (fpsCap && pointers.size === 0 && now - lastRender < 16.67) {
       // display can render faster than 60fps — skip this tick entirely so
       // we don't advance the sim or repaint, effectively capping at 60fps
       requestAnimationFrame(frame);
@@ -2973,6 +3084,8 @@ import * as THREE from 'three';
     }
     lastRender = now;
 
+    const rawFrameMs = now - (frame._prev || now);
+    updateQualityGovernor(rawFrameMs);
     const dt = Math.min(2, (now - last) / 16.67) * simSpeed;
     last = now;
     const audioEnergy = readAudioEnergy(now);
@@ -2988,12 +3101,16 @@ import * as THREE from 'three';
     // Build the active-touch list once per frame, not once per particle —
     // this single array is reused by every particle's applyTouchForces call
     // below instead of each of them touching the Map individually.
+    flushPointerSamples();
     const activePointers = pointers.size ? Array.from(pointers.values()) : EMPTY_POINTERS;
     // With 3+ touches down, also build the shared polygon once per frame
     // (ordering + edges + centroid) rather than re-deriving it per particle.
+    const touchSummary = activePointers.length ? summarizeTouches(activePointers) : null;
     const polygon = activePointers.length >= 3 ? buildPolygon(activePointers) : null;
 
-    updateCamera();
+    // Camera transforms are static between resize/mode changes. Calling lookAt
+    // every frame adds needless matrix work on the same main thread as input.
+    if (cameraDirty) updateCamera();
 
     // Any 3D mode: spin/tilt velocity target comes from whichever finger
     // is currently dragging fastest, rather than averaged across every
@@ -3031,8 +3148,7 @@ import * as THREE from 'three';
     // trail fade — same role as the old fillRect-at-partial-alpha trick,
     // just done as a GPU pass: draw the previous frame's texture into the
     // new render target, blended toward the background color.
-    const bg = PALETTES[paletteKey].bg;
-    const bgFloat = hexToRgbFloat(bg);
+    const bgFloat = paletteBgFloat;
     // Treble leaves a little extra light behind, creating a gentle shimmer rather than a strobe.
     const fadeAlpha = Math.max(0.02, 1 - trailAmt / 100 * 0.9 - audioEnergy.high * visualizer.trail);
 
@@ -3062,6 +3178,9 @@ import * as THREE from 'three';
     const zPulse = audioEnergy.kick * DEPTH * visualizer.zKick + audioEnergy.bass * DEPTH * visualizer.zBass;
     const halfW = W * 0.5;
     const halfH = H * 0.5;
+    const touchForceStride = touchForceStrideFor(activePointers.length, particles.length);
+    const touchForcePhase = (touchSimulationPhase++) % touchForceStride;
+    const touchForceDt = Math.min(3, reactiveDt * touchForceStride);
 
     for (let i = 0; i < particles.length; i++) {
       const pt = particles[i];
@@ -3079,7 +3198,9 @@ import * as THREE from 'three';
 
       // For flat modes with no active touch, the interaction routine would
       // only iterate an empty pointer list, so avoid the call entirely.
-      if (hasActivePointers) applyTouchForces(pt, reactiveDt, activePointers, polygon);
+      if (hasActivePointers && (touchForceStride === 1 || i % touchForceStride === touchForcePhase)) {
+        applyTouchForces(pt, touchForceDt, activePointers, polygon, touchSummary);
+      }
 
       // Kick drums shove the whole field outward from wherever the shockwave
       // is centered — same falloff shape as Repel, just sourced from the
@@ -3225,19 +3346,24 @@ import * as THREE from 'three';
 
     // ---------- Bloom: bright-pass -> blur x2 -> additive composite to screen ----------
     if (bloomEnabled) {
-      brightMaterial.uniforms.uSrc.value = dst.texture;
-      renderer.setRenderTarget(bloomFBOs[0]);
-      renderer.render(brightScene, postCamera);
+      // At the lowest automatic quality tier, reuse the bloom texture for one
+      // presentation frame. The glow is intentionally soft, so this is nearly
+      // imperceptible while avoiding three full-screen GPU passes every frame.
+      if ((bloomFrameCounter++ % bloomFrameInterval) === 0) {
+        brightMaterial.uniforms.uSrc.value = dst.texture;
+        renderer.setRenderTarget(bloomFBOs[0]);
+        renderer.render(brightScene, postCamera);
 
-      blurMaterial.uniforms.uSrc.value = bloomFBOs[0].texture;
-      blurMaterial.uniforms.uDirection.value.set(1 / bloomFBOs[0].width, 0);
-      renderer.setRenderTarget(bloomFBOs[1]);
-      renderer.render(blurScene, postCamera);
+        blurMaterial.uniforms.uSrc.value = bloomFBOs[0].texture;
+        blurMaterial.uniforms.uDirection.value.set(1 / bloomFBOs[0].width, 0);
+        renderer.setRenderTarget(bloomFBOs[1]);
+        renderer.render(blurScene, postCamera);
 
-      blurMaterial.uniforms.uSrc.value = bloomFBOs[1].texture;
-      blurMaterial.uniforms.uDirection.value.set(0, 1 / bloomFBOs[1].height);
-      renderer.setRenderTarget(bloomFBOs[0]);
-      renderer.render(blurScene, postCamera);
+        blurMaterial.uniforms.uSrc.value = bloomFBOs[1].texture;
+        blurMaterial.uniforms.uDirection.value.set(0, 1 / bloomFBOs[1].height);
+        renderer.setRenderTarget(bloomFBOs[0]);
+        renderer.render(blurScene, postCamera);
+      }
 
       compositeMaterial.uniforms.uBase.value = dst.texture;
       compositeMaterial.uniforms.uBloom.value = bloomFBOs[0].texture;
@@ -3258,7 +3384,8 @@ import * as THREE from 'three';
     pingpong = 1 - pingpong;
 
     if (now - lastHudUpdate >= HUD_UPDATE_INTERVAL) {
-      fpsEl.textContent = Math.round(fpsSmooth) + ' fps · ' + particles.length + ' particles';
+      const budgetSuffix = effectiveTargetCount < targetCount ? `/${targetCount}` : '';
+      fpsEl.textContent = Math.round(fpsSmooth) + ' fps · ' + particles.length + budgetSuffix + ' particles · q' + Math.round(renderQualityScale * 100) + '%';
       lastHudUpdate = now;
     }
 
@@ -3286,7 +3413,7 @@ import * as THREE from 'three';
       repeatMode, shuffleEnabled, playbackRate, backgroundPlaybackEnabled,
       visualizerPreset,
       bloomEnabled, bloomStrength: Math.round(bloomStrengthMult * 100), hotCoreEnabled, sparkleEnabled,
-      sharpRender
+      sharpRender, performanceSafeguards: qualityMode === 'auto'
     }));
   }
 
@@ -3298,6 +3425,7 @@ import * as THREE from 'three';
     chip.textContent = m;
     chip.addEventListener('click', () => {
       mode = m;
+      cameraDirty = true;
       // Give each hybrid volume a clean three-quarter presentation angle on
       // entry. This avoids a previous mode's accidental edge-on orientation
       // making a torus or field volume appear as an unconvincing bright bar.
@@ -3329,6 +3457,7 @@ import * as THREE from 'three';
     sw.innerHTML = `<span>${pal.name}</span>`;
     sw.addEventListener('click', () => {
       paletteKey = key;
+      paletteBgFloat = hexToRgbFloat(PALETTES[paletteKey].bg);
       [...paletteRow.children].forEach(s => s.classList.remove('active'));
       sw.classList.add('active');
       // Recolor the existing field to match — particles stay, only their look changes.
@@ -3493,6 +3622,29 @@ import * as THREE from 'three';
     saveSettings();
   });
 
+  const autoPerfBtn = document.getElementById('autoPerfBtn');
+  function setPerformanceSafeguards(enabled) {
+    qualityMode = enabled ? 'auto' : 'off';
+    autoPerfBtn.classList.toggle('active', enabled);
+    autoPerfBtn.textContent = 'Auto safeguards: ' + (enabled ? 'on' : 'off');
+    slowFrameStreak = 0;
+    fastFrameStreak = 0;
+    pendingQualityScale = null;
+    // Turning safeguards off immediately restores exact selected resolution and
+    // full bloom cadence. Population then reconciles back to the target count.
+    if (!enabled) {
+      bloomFrameInterval = 1;
+      if (renderQualityScale !== 1) {
+        renderQualityScale = 1;
+        resize();
+      }
+    }
+  }
+  autoPerfBtn.addEventListener('click', () => {
+    setPerformanceSafeguards(qualityMode !== 'auto');
+    saveSettings();
+  });
+
   // Restore last-used settings, if any. Called after every control is
   // wired up so we can just set values + click the right chips/swatches
   // rather than duplicating each handler's logic.
@@ -3513,6 +3665,9 @@ import * as THREE from 'three';
     if (typeof saved.bloomEnabled === 'boolean' && saved.bloomEnabled !== bloomEnabled) bloomBtn.click();
     if (typeof saved.hotCoreEnabled === 'boolean' && saved.hotCoreEnabled !== hotCoreEnabled) hotCoreBtn.click();
     if (typeof saved.sparkleEnabled === 'boolean' && saved.sparkleEnabled !== sparkleEnabled) sparkleBtn.click();
+    // `performanceSafeguards` is intentionally a new, explicit preference.
+    // Older automatic settings are ignored so this version always starts at full fidelity.
+    if (saved.performanceSafeguards === true) setPerformanceSafeguards(true);
     if (typeof saved.sharpRender === 'boolean' && saved.sharpRender !== sharpRender) sharpBtn.click();
     if (typeof saved.bloomStrength === 'number') { bloomStrengthSlider.value = saved.bloomStrength; bloomStrengthSlider.dispatchEvent(new Event('input')); }
     if (typeof saved.volume === 'number') { volumeSlider.value = saved.volume; volumeSlider.dispatchEvent(new Event('input')); }
@@ -3595,6 +3750,8 @@ import * as THREE from 'three';
 
   let kickX = 0, kickY = 0; // where the kick's shockwave currently radiates from
   let lastBeatCheckMs = null;
+  let lastAudioAnalysisMs = -Infinity;
+  const AUDIO_ANALYSIS_INTERVAL = 33; // spectrum data need not be sampled at display-refresh frequency
 
   function bandEnergy(start, end) {
     if (!beatFrequencyData) return 0;
@@ -3755,9 +3912,12 @@ import * as THREE from 'three';
       audioLevels.snare = snareTracker.pulse;
       audioLevels.hat = hatTracker.pulse;
       lastBeatCheckMs = null; // resync cleanly instead of one huge dtMs on resume
+      lastAudioAnalysisMs = -Infinity;
       return audioLevels;
     }
 
+    if (nowMs - lastAudioAnalysisMs < AUDIO_ANALYSIS_INTERVAL) return audioLevels;
+    lastAudioAnalysisMs = nowMs;
     analyser.getByteFrequencyData(frequencyData);
     const bins = frequencyData.length;
     const bass = averageFrequencyRange(0, Math.floor(bins * 0.12));
