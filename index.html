@@ -4502,63 +4502,24 @@ import * as THREE from 'three';
     }
   }
 
-  // SHA-256 of the file bytes — two files with the same hash are byte-for-byte
-  // copies no matter what they're named.
-  async function hashBlob(blob) {
-    const digest = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
-    return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
-  }
-  const normName = (name) => String(name || '').trim().toLowerCase();
-
   loadFileBtn.addEventListener('click', () => audioFileInput.click());
   audioFileInput.addEventListener('change', async () => {
     const files = Array.from(audioFileInput.files || []);
-    audioFileInput.value = '';
     if (!files.length) return;
     const list = getPlaylist();
-    soundStatus.textContent = 'adding to library…';
-
-    // Backfill hashes/sizes for older library entries so they count as known.
-    let backfilled = false;
-    for (const item of list) {
-      if (item.kind !== 'file' || (item.hash && item.size != null)) continue;
-      try {
-        const blob = await loadBlob(item.id);
-        if (!blob) continue;
-        item.hash = await hashBlob(blob);
-        item.size = blob.size;
-        backfilled = true;
-      } catch {}
-    }
-    if (backfilled) savePlaylist(list);
-
-    const knownHashes = new Set(list.filter((x) => x.hash).map((x) => x.hash));
-    const knownNameSize = new Set(list.filter((x) => x.kind === 'file' && x.size != null)
-      .map((x) => normName(x.name) + '|' + x.size));
-
     let imported = 0;
-    let skipped = 0;
     for (const file of files) {
-      const nameKey = normName(file.name) + '|' + file.size;
-      // Same name + same size is treated as the same track without reading it.
-      if (knownNameSize.has(nameKey)) { skipped++; continue; }
-      let hash;
-      try { hash = await hashBlob(file); } catch { hash = null; }
-      if (hash && knownHashes.has(hash)) { skipped++; continue; }
+      // Files are stored independently, so repeated imports remain intentional
+      // and can be removed or reordered as separate queue entries.
       const id = 'f_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
       await saveBlob(id, file);
-      list.push({ id, name: file.name, kind: 'file', size: file.size, hash });
-      if (hash) knownHashes.add(hash);
-      knownNameSize.add(nameKey);
+      list.push({ id, name: file.name, kind: 'file' });
       imported++;
-      // Each track lands in the library as soon as it's stored, not at the end.
-      savePlaylist(list);
-      renderPlaylist();
-      updatePlayerControls();
     }
-    const parts = [`${imported} ${imported === 1 ? 'track' : 'tracks'} added to library`];
-    if (skipped) parts.push(`${skipped} duplicate${skipped === 1 ? '' : 's'} skipped`);
-    soundStatus.textContent = parts.join(', ');
+    savePlaylist(list);
+    audioFileInput.value = '';
+    soundStatus.textContent = `${imported} ${imported === 1 ? 'track' : 'tracks'} imported`;
+    renderPlaylist();
   });
 
   loadUrlBtn.addEventListener('click', () => {
